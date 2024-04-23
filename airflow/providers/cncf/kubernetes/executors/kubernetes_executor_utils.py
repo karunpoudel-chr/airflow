@@ -19,13 +19,14 @@ from __future__ import annotations
 import contextlib
 import json
 import multiprocessing
+import os
 import time
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from kubernetes import client, watch
 from kubernetes.client.rest import ApiException
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import InvalidChunkLength, ProtocolError, ReadTimeoutError
 
 from airflow.exceptions import AirflowException
 from airflow.providers.cncf.kubernetes.kube_client import get_kube_client
@@ -100,6 +101,9 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
         self.watcher_queue = watcher_queue
         self.resource_version = resource_version
         self.kube_config = kube_config
+        time_out = os.getenv("KUBERNETES_EXECUTOR__WATCHER_TIMEOUT")
+        self.time_out = int(time_out) if time_out else None
+        self.log.info(f"KUBERNETES_EXECUTOR__WATCHER_TIMEOUT: {self.time_out}")
 
     def run(self) -> None:
         """Perform watching."""
@@ -116,7 +120,13 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 self.log.warning(
                     "There was a timeout error accessing the Kube API. Retrying request.", exc_info=True
                 )
-                time.sleep(1)
+            except ProtocolError as e:
+                if isinstance(e.__cause__, InvalidChunkLength):
+                    self.log.warning(
+                        "There was a InvalidChunkLength error accessing the Kube API. Retrying request.", exc_info=True
+                    )
+                else:
+                    raise
             except Exception:
                 self.log.exception("Unknown error in KubernetesJobWatcher. Failing")
                 self.resource_version = "0"
@@ -157,6 +167,8 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
         self.log.info("Event: and now my watch begins starting at resource_version: %s", resource_version)
 
         kwargs = {"label_selector": f"airflow-worker={scheduler_job_id}"}
+        if self.time_out:
+            kwargs["_request_timeout"] = self.time_out
         if resource_version:
             kwargs["resource_version"] = resource_version
         if kube_config.kube_client_request_args:
